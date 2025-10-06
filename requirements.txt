@@ -3,5 +3,6 @@ pandas>=2.2.0
 openpyxl>=3.1.2
 docxtpl>=0.16.8
 python-docx>=1.1.0
-docx2pdf>=0.1.8
 reportlab>=3.6.13
+# docx2pdf opcional si alguna vez quieres convertir DOCX->PDF con Word/LibreOffice
+# docx2pdf>=0.1.8
