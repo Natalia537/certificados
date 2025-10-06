@@ -1,9 +1,9 @@
+# certificados.py
 import io
 import re
 import zipfile
 import shutil
 import tempfile
-import platform
 import subprocess
 import unicodedata
 from zipfile import ZipFile
@@ -12,6 +12,11 @@ from pathlib import Path
 import streamlit as st
 import pandas as pd
 from docxtpl import DocxTemplate
+
+# ============== NUEVO: PDF nativo (sin Word/LibreOffice) ==============
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import inch
 
 # ===================== Utilidades =====================
 
@@ -31,42 +36,6 @@ def sanitize_filename(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", str(name))
     name = name.strip().strip(".")
     return (name or "documento")[:200]
-
-def can_convert_pdf() -> bool:
-    """¿Hay docx2pdf (Word) o LibreOffice disponibles para convertir a PDF?"""
-    try:
-        from docx2pdf import convert  # noqa: F401
-        return True
-    except Exception:
-        pass
-    soffice = shutil.which("soffice") or shutil.which("libreoffice")
-    return bool(soffice)
-
-def try_docx_to_pdf(input_docx: Path, output_pdf: Path) -> bool:
-    """Convierte DOCX→PDF con docx2pdf (Word) o LibreOffice (si están disponibles)."""
-    try:
-        from docx2pdf import convert as docx2pdf_convert
-        docx2pdf_convert(str(input_docx), str(output_pdf))
-        return output_pdf.exists()
-    except Exception:
-        pass
-
-    soffice = shutil.which("soffice") or shutil.which("libreoffice")
-    if soffice:
-        try:
-            outdir = output_pdf.parent
-            cmd = [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(outdir), str(input_docx)]
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            gen_file = input_docx.with_suffix(".pdf")
-            gen_file_out = outdir / gen_file.name
-            if gen_file_out.exists():
-                if gen_file_out != output_pdf:
-                    gen_file_out.replace(output_pdf)
-                return True
-        except Exception:
-            pass
-
-    return False
 
 def render_docx_from_template(template_bytes: bytes, context: dict) -> bytes:
     tpl = DocxTemplate(io.BytesIO(template_bytes))
@@ -95,10 +64,58 @@ def extract_placeholders_best_effort(docx_bytes: bytes):
                         placeholders.add(m.strip())
     except Exception:
         pass
-    # Filtra cosas raras (líneas muy largas)
     candidates = [p for p in placeholders if len(p) <= 80]
-    # Orden alfabético por versión normalizada (acento-insensible)
     return sorted(candidates, key=lambda x: normalize_key(x))
+
+# ===================== PDF nativo simple =====================
+
+def crear_pdf_certificado(nombre_archivo_base: str, datos_dict: dict) -> bytes:
+    """
+    Genera un PDF simple con los datos del certificado.
+    No depende de Word ni de LibreOffice.
+    """
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+
+    # Título
+    c.setFont("Helvetica-Bold", 20)
+    c.drawCentredString(width / 2, height - 1.6 * inch, "CERTIFICADO DE PARTICIPACIÓN")
+
+    # Si existe un campo tipo 'Nombre', lo destacamos al centro
+    nombre_keys = ["NOMBRE", "NOMBRE COMPLETO", "NOMBRE Y APELLIDO", "ALUMNO", "ESTUDIANTE", "PARTICIPANTE", "NAME", "FULL NAME"]
+    nombre_val = ""
+    for k, v in datos_dict.items():
+        if normalize_key(k) in [normalize_key(x) for x in nombre_keys]:
+            nombre_val = str(v)
+            break
+    if nombre_val:
+        c.setFont("Helvetica-Bold", 16)
+        c.drawCentredString(width / 2, height - 2.2 * inch, nombre_val)
+
+    # Cuerpo de campos (izquierda)
+    c.setFont("Helvetica", 12)
+    y = height - 3.0 * inch
+    margen_x = 1.25 * inch
+    for k, v in datos_dict.items():
+        k_clean = str(k).strip().strip("{} ")
+        texto = f"{k_clean}: {v}"
+        c.drawString(margen_x, y, texto)
+        y -= 0.35 * inch
+        if y < 1.3 * inch:  # salto si se acaba la página
+            c.showPage()
+            c.setFont("Helvetica", 12)
+            y = height - 1.5 * inch
+
+    # Pie
+    c.setFont("Helvetica-Oblique", 10)
+    c.drawString(margen_x, 1.0 * inch, "Emitido automáticamente por el generador de certificados.")
+
+    c.showPage()
+    c.save()
+    pdf_data = buffer.getvalue()
+    buffer.close()
+    return pdf_data
 
 # ===================== App =====================
 
@@ -110,8 +127,8 @@ with st.sidebar:
     st.write("1) Sube tu **machote .docx** con placeholders como `{{Nombre}}`, `{{Cédula}}`, `{{Calificación}}`.")
     st.write("2) Sube tu **Excel** con columnas de datos.")
     st.write("3) **Mapea** cada placeholder → columna del Excel (o un valor fijo).")
-    st.write("4) Genera **ZIP de DOCX** (si tu entorno lo permite, también **ZIP de PDF**).")
-    st.caption("Tip: Si un placeholder no aparece en la lista (por formato del Word), agrégalo manualmente.")
+    st.write("4) Descarga **ZIP de DOCX** o **ZIP de PDF nativo** (no requiere Word).")
+    st.caption("Si un placeholder no aparece en 'detectados', agrégalo manualmente abajo.")
 
 col1, col2 = st.columns([1, 1])
 
@@ -141,14 +158,13 @@ if tpl_file and xls_file and sheet_name:
         st.error(f"Error leyendo la hoja '{sheet_name}': {e}")
         st.stop()
 
-    # Columnas originales y normalizadas (para sugerencias sólidas)
     cols_original = list(df.columns)
     cols_norm_map = {c: normalize_key(c) for c in cols_original}
 
     st.subheader("🧾 Columnas del Excel")
     st.write(", ".join(map(str, cols_original)))
 
-    # --- Leer placeholders sugeridos del Word (solo para ayudar) ---
+    # --- Leer placeholders sugeridos del Word ---
     tpl_bytes = tpl_file.read()
     suggested_placeholders = extract_placeholders_best_effort(tpl_bytes)
     if suggested_placeholders:
@@ -159,15 +175,13 @@ if tpl_file and xls_file and sheet_name:
 
     st.subheader("🔗 Mapear placeholders del Word ↔ columnas del Excel")
 
-    # Botón para autogenerar mapeos a partir de sugerencias
     def add_mapping_if_missing(ph: str, col_guess: str | None):
-        # Evita duplicados por placeholder exacto
         for m in st.session_state.mappings:
             if m["placeholder"] == ph:
                 return
         st.session_state.mappings.append({
-            "placeholder": ph,          # tal cual aparece en Word, con acentos, may/min
-            "column": col_guess or "",  # nombre de columna ORIGINAL (o vacío si sin match)
+            "placeholder": ph,          # tal cual en Word (con acentos/may/min)
+            "column": col_guess or "",  # nombre de columna ORIGINAL
             "default": ""               # valor fijo si la celda viene vacía
         })
 
@@ -178,7 +192,6 @@ if tpl_file and xls_file and sheet_name:
     with cta_cols[1]:
         if st.button("✨ Autocompletar desde placeholders"):
             for ph in suggested_placeholders:
-                # Buscar mejor columna por normalización
                 ph_norm = normalize_key(ph)
                 best = None
                 for c in cols_original:
@@ -187,8 +200,6 @@ if tpl_file and xls_file and sheet_name:
                         break
                 add_mapping_if_missing(ph, best)
 
-    # Render de filas de mapeo
-    # Actualizamos el estado con los inputs
     new_mappings = []
     for idx, m in enumerate(st.session_state.mappings):
         st.markdown(f"**Mapeo {idx+1}**")
@@ -205,9 +216,8 @@ if tpl_file and xls_file and sheet_name:
 
     st.session_state.mappings = new_mappings
 
-    # Selección de columna para usar en el NOMBRE DE ARCHIVO
+    # Columna que se usará para el NOMBRE DE ARCHIVO
     st.subheader("👤 Columna para el **nombre del archivo**")
-    # Sugerimos por nombres típicos
     candidatos_nombre = ["NOMBRE", "NOMBRE COMPLETO", "NOMBRE Y APELLIDO", "ALUMNO", "ESTUDIANTE", "PARTICIPANTE", "NAME", "FULL NAME"]
     auto_idx = 0
     for i, c in enumerate(cols_original):
@@ -225,16 +235,17 @@ if tpl_file and xls_file and sheet_name:
     if not valid_mappings:
         st.info("Agrega al menos un mapeo (placeholder → columna o valor por defecto) para generar certificados.")
 
+    # ---------------- DOCX ----------------
     with c1:
         if st.button("⬇️ Generar ZIP de DOCX", type="primary", disabled=(len(valid_mappings) == 0)):
             with st.spinner("Generando documentos DOCX..."):
                 memory_zip = io.BytesIO()
                 with ZipFile(memory_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                     for i in range(len(df)):
-                        # Construir contexto EXACTO tal como el Word espera
+                        # Construir contexto EXACTO como el Word espera
                         ctx = {}
                         for m in valid_mappings:
-                            key = m["placeholder"]  # EXACTO como en Word (con acentos/may/min)
+                            key = m["placeholder"]  # EXACTO (con acentos/may/min)
                             if m["column"]:
                                 val = df.iloc[i][m["column"]]
                                 if pd.isna(val) or val == "":
@@ -260,69 +271,39 @@ if tpl_file and xls_file and sheet_name:
                 mime="application/zip"
             )
 
+    # ---------------- PDF nativo (ReportLab) ----------------
     with c2:
-    if st.button("⬇️ Generar ZIP de PDF (simple PDF nativo)", type="secondary"):
-        with st.spinner("Generando PDFs..."):
-            memory_zip = io.BytesIO()
-            with ZipFile(memory_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for i in range(len(df)):
-                    ctx = {}
-                    for m in valid_mappings:
-                        key = m["placeholder"]
-                        if m["column"]:
-                            val = df.iloc[i][m["column"]]
-                            if pd.isna(val) or val == "":
+        if st.button("⬇️ Generar ZIP de PDF (nativo, sin Word) ", type="secondary", disabled=(len(valid_mappings) == 0)):
+            with st.spinner("Generando PDFs..."):
+                memory_zip = io.BytesIO()
+                with ZipFile(memory_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    for i in range(len(df)):
+                        # Contexto de datos para imprimir en el PDF
+                        ctx = {}
+                        for m in valid_mappings:
+                            key = m["placeholder"]
+                            if m["column"]:
+                                val = df.iloc[i][m["column"]]
+                                if pd.isna(val) or val == "":
+                                    val = m["default"]
+                            else:
                                 val = m["default"]
-                        else:
-                            val = m["default"]
-                        ctx[key] = "" if val is None else val
+                            ctx[key] = "" if val is None else val
 
-                    base_name_val = df.iloc[i][nombre_col_original]
-                    base_name_val = sanitize_filename(base_name_val) if base_name_val else f"documento_{i+1}"
-                    pdf_bytes = crear_pdf_certificado(base_name_val, ctx)
-                    zf.writestr(f"{base_name_val} - Certificado.pdf", pdf_bytes)
+                        base_name_val = df.iloc[i][nombre_col_original]
+                        base_name_val = sanitize_filename(base_name_val) if base_name_val else f"documento_{i+1}"
 
-            memory_zip.seek(0)
-        st.download_button(
-            "Descargar PDF.zip",
-            data=memory_zip,
-            file_name="certificados_pdf.zip",
-            mime="application/zip"
-        )
+                        pdf_bytes = crear_pdf_certificado(base_name_val, ctx)
+                        zf.writestr(f"{base_name_val} - Certificado.pdf", pdf_bytes)
 
-                    # Render a disco
-                    doc_bytes = render_docx_from_template(tpl_bytes, ctx)
-                    docx_path.write_bytes(doc_bytes)
-                    docx_paths.append(docx_path)
-
-                # Convertir cada DOCX a PDF
-                from reportlab.lib.pagesizes import A4
-                from reportlab.pdfgen import canvas
-                from reportlab.lib.units import inch
-                
-                def crear_pdf_certificado(nombre_archivo, datos_dict):
-                    buffer = io.BytesIO()
-                    c = canvas.Canvas(buffer, pagesize=A4)
-                    width, height = A4
-                    c.setFont("Helvetica-Bold", 18)
-                    c.drawCentredString(width / 2, height - 2 * inch, "CERTIFICADO DE PARTICIPACIÓN")
-                    c.setFont("Helvetica", 12)
-                    y = height - 3 * inch
-                
-                    for k, v in datos_dict.items():
-                        texto = f"{k}: {v}"
-                        c.drawString(1.5 * inch, y, texto)
-                        y -= 0.4 * inch
-                
-                    c.setFont("Helvetica-Oblique", 10)
-                    c.drawString(1.5 * inch, 1.5 * inch, "Emitido automáticamente.")
-                    c.showPage()
-                    c.save()
-                    pdf_data = buffer.getvalue()
-                    buffer.close()
-                    return pdf_data
-
+                memory_zip.seek(0)
+            st.download_button(
+                "Descargar PDF.zip",
+                data=memory_zip,
+                file_name="certificados_pdf.zip",
+                mime="application/zip"
+            )
 
 st.markdown("---")
 st.caption("Si algún placeholder no aparece en 'detectados', agrégalo manualmente en los mapeos. "
-           "Esto resuelve los casos en los que Word divide el texto `{{...}}` en varios fragmentos.")
+           "Esta versión genera PDF nativo (ReportLab), por lo que funciona también en la nube.")
