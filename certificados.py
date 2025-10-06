@@ -261,21 +261,10 @@ if tpl_file and xls_file and sheet_name:
             )
 
     with c2:
-        pdf_ok = can_convert_pdf()
-        pdf_btn = st.button("⬇️ Generar ZIP de PDF", disabled=(not pdf_ok or len(valid_mappings) == 0))
-
-        if not pdf_ok:
-            st.info("⚠️ Conversión a PDF no disponible en este entorno. "
-                    "En Windows/Mac instala **Microsoft Word** (para `docx2pdf`). "
-                    "En Linux instala **LibreOffice** (`soffice`) y agrégalo al PATH.")
-
-        if pdf_btn:
-            with st.spinner("Generando documentos PDF..."):
-                tempdir = tempfile.TemporaryDirectory()
-                outdir = Path(tempdir.name)
-                pdf_zip = io.BytesIO()
-
-                docx_paths = []
+    if st.button("⬇️ Generar ZIP de PDF (simple PDF nativo)", type="secondary"):
+        with st.spinner("Generando PDFs..."):
+            memory_zip = io.BytesIO()
+            with ZipFile(memory_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                 for i in range(len(df)):
                     ctx = {}
                     for m in valid_mappings:
@@ -290,7 +279,16 @@ if tpl_file and xls_file and sheet_name:
 
                     base_name_val = df.iloc[i][nombre_col_original]
                     base_name_val = sanitize_filename(base_name_val) if base_name_val else f"documento_{i+1}"
-                    docx_path = outdir / f"{base_name_val} - Certificado.docx"
+                    pdf_bytes = crear_pdf_certificado(base_name_val, ctx)
+                    zf.writestr(f"{base_name_val} - Certificado.pdf", pdf_bytes)
+
+            memory_zip.seek(0)
+        st.download_button(
+            "Descargar PDF.zip",
+            data=memory_zip,
+            file_name="certificados_pdf.zip",
+            mime="application/zip"
+        )
 
                     # Render a disco
                     doc_bytes = render_docx_from_template(tpl_bytes, ctx)
@@ -298,28 +296,32 @@ if tpl_file and xls_file and sheet_name:
                     docx_paths.append(docx_path)
 
                 # Convertir cada DOCX a PDF
-                pdf_paths = []
-                for docx_path in docx_paths:
-                    pdf_path = docx_path.with_suffix(".pdf")
-                    ok = try_docx_to_pdf(docx_path, pdf_path)
-                    if ok and pdf_path.exists():
-                        pdf_paths.append(pdf_path)
+                from reportlab.lib.pagesizes import A4
+                from reportlab.pdfgen import canvas
+                from reportlab.lib.units import inch
+                
+                def crear_pdf_certificado(nombre_archivo, datos_dict):
+                    buffer = io.BytesIO()
+                    c = canvas.Canvas(buffer, pagesize=A4)
+                    width, height = A4
+                    c.setFont("Helvetica-Bold", 18)
+                    c.drawCentredString(width / 2, height - 2 * inch, "CERTIFICADO DE PARTICIPACIÓN")
+                    c.setFont("Helvetica", 12)
+                    y = height - 3 * inch
+                
+                    for k, v in datos_dict.items():
+                        texto = f"{k}: {v}"
+                        c.drawString(1.5 * inch, y, texto)
+                        y -= 0.4 * inch
+                
+                    c.setFont("Helvetica-Oblique", 10)
+                    c.drawString(1.5 * inch, 1.5 * inch, "Emitido automáticamente.")
+                    c.showPage()
+                    c.save()
+                    pdf_data = buffer.getvalue()
+                    buffer.close()
+                    return pdf_data
 
-                if not pdf_paths:
-                    st.error("No se pudieron generar PDFs. Verifica que Word/LibreOffice estén instalados.")
-                else:
-                    with ZipFile(pdf_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                        for p in pdf_paths:
-                            zf.write(p, arcname=p.name)
-                    pdf_zip.seek(0)
-                    st.download_button(
-                        "Descargar PDF.zip",
-                        data=pdf_zip,
-                        file_name="certificados_pdf.zip",
-                        mime="application/zip"
-                    )
-
-                tempdir.cleanup()
 
 st.markdown("---")
 st.caption("Si algún placeholder no aparece en 'detectados', agrégalo manualmente en los mapeos. "
